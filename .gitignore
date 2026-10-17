@@ -1,0 +1,17 @@
+# 构建目录（CMake 可随时重新生成）
+build*/
+.vs/
+.vscode/
+out/
+CMakeSettings.json
+
+# 程序运行时在 exe 目录写出的数据文件
+imgui.ini
+mag_calib.txt
+mag_calib_samples.txt
+field_survey.txt
+imu_data_*.txt
+
+# 系统杂项
+Thumbs.db
+Desktop.ini
