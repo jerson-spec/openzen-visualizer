@@ -4,6 +4,7 @@
 #include "DataBuffer.h"
 #include "DeltaTEstimator.h"
 #include "MagEllipsoidCalib.h"
+#include "MagFieldMap.h"
 #include "MadgwickFilter.h"
 #include "ComplementaryFilter.h"
 #include "EKFFilter.h"
@@ -499,6 +500,104 @@ public:
     /// field_survey.txt 累计已写入的标记行数
     int surveyRowCount() const { return m_surveyRows.load(); }
 
+    // === Field map：室内干扰场图（v0 离散格点表） ===
+
+    /// 场图文件名（exe 运行目录）
+    static constexpr const char* kFieldMapFileName = "mag_field_map.txt";
+
+    /**
+     * @brief 从 exe 目录 field_survey.txt 建图（同标签跨会话平均），
+     *        并保存到 mag_field_map.txt。成功后 fieldMapValid() 为 true。
+     * @param refLabel 参考格标签；空则用第一个出现的标签
+     * @param msg      返回结果描述（成功：格点数与参考格；失败：原因）
+     */
+    bool buildFieldMap(const std::string& refLabel, std::string& msg) {
+        std::vector<MagFieldMap::SurveyRow> rows;
+        std::string err;
+        if (!MagFieldMap::parseSurveyFile(kSurveyFileName, rows, err)) {
+            msg = err;
+            return false;
+        }
+        MagFieldMap::Result res = MagFieldMap::build(rows, refLabel, currentMagFit().fieldMag);
+        if (!res.ok) {
+            msg = "build failed (no entries)";
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_fieldMapMutex);
+            m_fieldMap = res;
+        }
+        m_fieldMapValid.store(true);
+        if (!MagFieldMap::save(kFieldMapFileName, res)) {
+            msg = "map built, but failed to write " + std::string(kFieldMapFileName);
+        } else {
+            msg = "map built: " + std::to_string(res.entries.size()) + " cells, ref = "
+                + res.entries[res.refIndex].label;
+        }
+        // yaw 基准已变，补偿开启时重置滤波器
+        if (m_fieldMapEnabled.load()) {
+            m_filter.reset();
+            m_compFilter.reset();
+            m_ekfFilter.reset();
+        }
+        return true;
+    }
+
+    void fieldMapSnapshot(MagFieldMap::Result& out) const {
+        std::lock_guard<std::mutex> lock(m_fieldMapMutex);
+        out = m_fieldMap;
+    }
+    bool fieldMapValid() const { return m_fieldMapValid.load(); }
+    bool fieldMapEnabled() const { return m_fieldMapEnabled.load(); }
+    int fieldMapActive() const { return m_fieldMapActive.load(); }
+
+    /// 补偿总开关。切换时重置三个滤波器（yaw 基准变了，旧对齐失效）。
+    void setFieldMapEnabled(bool on) {
+        if (m_fieldMapEnabled.exchange(on) != on) {
+            m_filter.reset();
+            m_compFilter.reset();
+            m_ekfFilter.reset();
+        }
+    }
+
+    /// 选择补偿所用格点（"传感器当前在哪格"）。切换时同样重置滤波器。
+    bool setFieldMapActive(int idx) {
+        MagFieldMap::Result snap;
+        fieldMapSnapshot(snap);
+        if (!snap.ok || idx < 0 || idx >= (int)snap.entries.size()) return false;
+        if (m_fieldMapActive.exchange(idx) != idx) {
+            m_filter.reset();
+            m_compFilter.reset();
+            m_ekfFilter.reset();
+        }
+        return true;
+    }
+
+    /// 更换参考格（只改 refIndex 并重存文件，无需重新解析 survey）
+    bool setFieldMapRef(int idx) {
+        std::lock_guard<std::mutex> lock(m_fieldMapMutex);
+        if (!m_fieldMap.ok || idx < 0 || idx >= (int)m_fieldMap.entries.size()) return false;
+        if (m_fieldMap.refIndex != idx) {
+            m_fieldMap.refIndex = idx;
+            MagFieldMap::save(kFieldMapFileName, m_fieldMap);
+            if (m_fieldMapEnabled.load()) {
+                m_filter.reset();
+                m_compFilter.reset();
+                m_ekfFilter.reset();
+            }
+        }
+        return true;
+    }
+
+    /// 启动连接时从 exe 目录读回场图（仿 loadMagCalibration）
+    void loadFieldMap() {
+        MagFieldMap::Result res;
+        if (!MagFieldMap::load(kFieldMapFileName, res)) return;
+        std::lock_guard<std::mutex> lock(m_fieldMapMutex);
+        m_fieldMap = res;
+        m_fieldMapValid.store(true);
+    }
+
 
 private:
     /**
@@ -590,6 +689,7 @@ private:
 
         // ?????V??????????????T????????V?K????K???????N?exe ?T?????? mag_calib.txt???N??V??????????N?
         loadMagCalibration();
+        loadFieldMap();
 
         // === ????@???? 5: ???????????????????C???v?T??? ===
         while (m_running.load()) {
@@ -637,7 +737,52 @@ private:
             double magD[3];
             const MagEllipsoidCalib::Result fit = currentMagFit();
             MagEllipsoidCalib::apply(fit, imuData.b[0], imuData.b[1], imuData.b[2], magD);
-            const float mag[3] = { (float)magD[0], (float)magD[1], (float)magD[2] };
+            const float magRaw[3] = { (float)magD[0], (float)magD[1], (float)magD[2] };
+
+            // --- 场图补偿（v0：离散格点表） ---
+            // 椭球校准对环境场方向"盲"，固定磁物体让每个位置的"北"指向不同。
+            // 场图存有调查水平系下每格的场向量；这里把当前活动格的干扰
+            // dB = B(p) - B(ref) 旋到传感器系从测量中扣除，滤波器看到的
+            // 从此是参考点的"干净"场。mag 喂滤波器与 GUI；magRaw 保持原始
+            // 供 TSV 记录与 Field Survey 建图（数据不受本开关影响）。
+            float magUse[3] = { magRaw[0], magRaw[1], magRaw[2] };
+            if (m_fieldMapEnabled.load() && m_fieldMapValid.load()) {
+                MagFieldMap::Result fmap;
+                {
+                    std::lock_guard<std::mutex> lock(m_fieldMapMutex);
+                    fmap = m_fieldMap;
+                }
+                const int act = m_fieldMapActive.load();
+                double dLevel[3];
+                if (fmap.ok && fmap.deltaLevel(act, dLevel)) {
+                    const double accD[3] = { acc[0], acc[1], acc[2] };
+                    const double aN = std::sqrt(accD[0] * accD[0] + accD[1] * accD[1]
+                                              + accD[2] * accD[2]);
+                    if (aN > 0.1) {
+                        double roll, pitch;
+                        MagFieldMap::accToRollPitch(accD, roll, pitch);
+                        // 当前测量的传感器系场向量 (uT) 与其水平系航向
+                        const double Bs[3] = { (double)magRaw[0] * fit.fieldMag,
+                                               (double)magRaw[1] * fit.fieldMag,
+                                               (double)magRaw[2] * fit.fieldMag };
+                        double lvlNow[3];
+                        const double hRaw = MagFieldMap::toLevel(Bs, roll, pitch, lvlNow);
+                        // 活动格干扰（调查水平系）-> 传感器系 -> 扣除
+                        double dS[3];
+                        MagFieldMap::deltaToSensor(dLevel, roll, pitch,
+                                                   fmap.alphaRad(act), hRaw, dS);
+                        const double Bc[3] = { Bs[0] - dS[0], Bs[1] - dS[1], Bs[2] - dS[2] };
+                        const double nBc = std::sqrt(Bc[0] * Bc[0] + Bc[1] * Bc[1]
+                                                   + Bc[2] * Bc[2]);
+                        if (nBc > 1e-9) {
+                            magUse[0] = (float)(Bc[0] / nBc);
+                            magUse[1] = (float)(Bc[1] / nBc);
+                            magUse[2] = (float)(Bc[2] / nBc);
+                        }
+                    }
+                }
+            }
+            const float mag[3] = { magUse[0], magUse[1], magUse[2] };
 
             // ????K???????????????N??V??????????????Y??T????????????[???N??????T???????????T??w???N?
             if (m_magCalibRunning.load()) {
@@ -667,6 +812,11 @@ private:
             }
 
             // ????????????????????? 4 ???C?v?????T???: [qw, qx, qy, qz]
+            // 未补偿向量：Field Survey / 建图数据源（与补偿开关无关）
+            data.magUnc[0] = magRaw[0];
+            data.magUnc[1] = magRaw[1];
+            data.magUnc[2] = magRaw[2];
+
             for (int i = 0; i < 4; i++) {
                 data.quat[i] = imuData.q[i];
             }
@@ -766,7 +916,7 @@ private:
                         << imuData.a[0] << "\t" << imuData.a[1] << "\t" << imuData.a[2] << "\t"
                         << imuData.g1[0] << "\t" << imuData.g1[1] << "\t" << imuData.g1[2] << "\t"
                         << imuData.w[0] << "\t" << imuData.w[1] << "\t" << imuData.w[2] << "\t"
-                        << mag[0] << "\t" << mag[1] << "\t" << mag[2] << "\t"
+                        << magRaw[0] << "\t" << magRaw[1] << "\t" << magRaw[2] << "\t"
                         << imuData.r[0] << "\t" << imuData.r[1] << "\t" << imuData.r[2] << "\t"
                         << imuData.q[0] << "\t" << imuData.q[1] << "\t" << imuData.q[2] << "\t" << imuData.q[3] << "\t"
                         << data.fusedEuler[0] << "\t" << data.fusedEuler[1] << "\t" << data.fusedEuler[2] << "\t"
@@ -948,6 +1098,13 @@ private:
     std::ofstream m_surveyFile;                ///< field_survey.txt，surveyMark() 首次调用时惰性打开
     std::mutex m_surveyFileMutex;              ///< 与 imu 记录文件互不相干，单独一把锁
     std::atomic<int> m_surveyRows{ 0 };        ///< 已写入的标记行数
+
+    // === Field map（室内干扰场图 v0） ===
+    mutable std::mutex m_fieldMapMutex;        ///< 保护 m_fieldMap（采集线程每帧读快照，GUI 线程写）
+    MagFieldMap::Result m_fieldMap;            ///< 当前场图（build/load 时更新）
+    std::atomic<bool> m_fieldMapValid{ false };
+    std::atomic<bool> m_fieldMapEnabled{ false };  ///< 补偿总开关（关 = 纯椭球校准）
+    std::atomic<int> m_fieldMapActive{ 0 };    ///< 补偿所用格点下标（"传感器当前在哪格"）
 
     // === 链路速率统计（PC 墙钟） ===
     std::atomic<double> m_linkRate5s{ 0.0 };   ///< 最近一个 5 秒窗口的实测数据率 (Hz)

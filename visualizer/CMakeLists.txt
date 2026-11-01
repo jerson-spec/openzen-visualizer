@@ -9,6 +9,7 @@ add_executable(OpenZenVisualizer
     GuiRenderer.h
     DeltaTEstimator.h
     MagEllipsoidCalib.h
+    MagFieldMap.h
     MadgwickFilter.h
     ComplementaryFilter.h
     EKFFilter.h

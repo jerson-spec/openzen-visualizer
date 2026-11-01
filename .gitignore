@@ -9,6 +9,7 @@ CMakeSettings.json
 imgui.ini
 mag_calib.txt
 mag_calib_samples.txt
+mag_field_map.txt
 field_survey.txt
 imu_data_*.txt
 

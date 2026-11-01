@@ -2,6 +2,7 @@
 
 #include "DataBuffer.h"
 #include "MagEllipsoidCalib.h"
+#include "MagFieldMap.h"
 #include "imgui.h"
 #include "implot.h"
 #include <vector>
@@ -49,6 +50,9 @@ struct GuiState {
     // Field Survey（桌面网格扫描读数工具）
     bool showSurveyWindow = true;             ///< 网格读数窗口，默认随程序打开
 
+    // Field Map（室内干扰场图）
+    bool showFieldMapWindow = true;            ///< 场图窗口，默认随程序打开
+
     // Control Panel 数据区折叠（一键收起/展开）
     bool secRaw = true, secFused = true, secComp = true, secEkf = true, secQuat = true;
 
@@ -83,6 +87,7 @@ public:
         renderEkfCompareWindow();
         renderMagCalibWindow();
         renderSurveyWindow();
+        renderFieldMapWindow();
         renderMainWindow(pOpen);
     }
 
@@ -106,6 +111,7 @@ private:
         ImGui::Checkbox("Euler Compare", &m_state.showEkfCompareWindow);
         ImGui::Checkbox("Mag Calibration", &m_state.showMagCalibWindow);
         ImGui::Checkbox("Field Survey", &m_state.showSurveyWindow);
+        ImGui::Checkbox("Field Map", &m_state.showFieldMapWindow);
 
         ImGui::Separator();
         ImGui::Text("Plot Settings");
@@ -461,18 +467,19 @@ private:
             const float pitch = std::atan2(-axn, std::sqrt(ayn * ayn + azn * azn));
             const float cr = std::cos(roll), sr = std::sin(roll);
             const float cp = std::cos(pitch), sp = std::sin(pitch);
-            const float mxh = d.mag[0] * cp + d.mag[1] * sr * sp + d.mag[2] * cr * sp;
-            const float myh = d.mag[1] * cr - d.mag[2] * sr;
+            const float mxh = d.magUnc[0] * cp + d.magUnc[1] * sr * sp + d.magUnc[2] * cr * sp;
+            const float myh = d.magUnc[1] * cr - d.magUnc[2] * sr;
             const double h = std::atan2(-(double)myh, (double)mxh);
             sumSin += std::sin(h);
             sumCos += std::cos(h);
             heads.push_back(h);
-            const double bm = std::sqrt((double)d.mag[0] * d.mag[0] + (double)d.mag[1] * d.mag[1]
-                                      + (double)d.mag[2] * d.mag[2]) * fit.fieldMag;
+            const double bm = std::sqrt((double)d.magUnc[0] * d.magUnc[0]
+                                      + (double)d.magUnc[1] * d.magUnc[1]
+                                      + (double)d.magUnc[2] * d.magUnc[2]) * fit.fieldMag;
             bSum += bm;
             bmags.push_back(bm);
             for (int i = 0; i < 3; ++i) {
-                magSum[i] += d.mag[i];
+                magSum[i] += d.magUnc[i];
                 bchSum[i] += d.magB[i];
                 accSum[i] += d.acc[i];
             }
@@ -545,6 +552,10 @@ private:
         if (!m_sensorThread.magCalibrationValid())
             ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
                                "No mag calibration loaded - heading/|B| are NOT calibrated!");
+        if (m_sensorThread.fieldMapEnabled())
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                "Field-map compensation is ON - marks stay raw (magUnc),\n"
+                "but keep it OFF while surveying so map data stays self-consistent.");
         ImGui::Separator();
 
         if (data.empty()) {
@@ -644,6 +655,189 @@ private:
                 ImGui::EndTable();
             }
         }
+
+        ImGui::End();
+    }
+
+    /// Field Map 窗口：场图构建 / 参考格与活动格选择 / 补偿开关 / 验证读数。
+    ///
+    /// v0 语义：场图是"按格点的离散表"，补偿时传感器必须在"活动格"上——
+    /// 格点选错 = 扣除错误的干扰向量。自动定位（磁指纹匹配）是下一阶段。
+    void renderFieldMapWindow() {
+        if (!m_state.showFieldMapWindow) return;
+        ImGui::SetNextWindowSize(ImVec2(680, 500), ImGuiCond_FirstUseEver);
+        if (!ImGui::Begin("Field Map", &m_state.showFieldMapWindow)) {
+            ImGui::End();
+            return;
+        }
+        constexpr double kPi = 3.14159265358979323846;
+
+        MagFieldMap::Result fmap;
+        m_sensorThread.fieldMapSnapshot(fmap);
+
+        ImGui::TextUnformatted("v0 discrete per-cell map. The ACTIVE cell's disturbance is");
+        ImGui::TextUnformatted("subtracted before the filters - the sensor MUST be at that cell!");
+        ImGui::Separator();
+
+        if (ImGui::Button("Build from field_survey.txt")) {
+            std::string msg;
+            std::string refLabel;
+            if (fmap.ok && m_mapRefSel >= 0 && m_mapRefSel < (int)fmap.entries.size())
+                refLabel = fmap.entries[m_mapRefSel].label;
+            if (m_sensorThread.buildFieldMap(refLabel, msg))
+                m_mapMsg = msg;
+            else
+                m_mapMsg = "BUILD FAILED: " + msg;
+            m_sensorThread.fieldMapSnapshot(fmap);
+            m_mapRefSel = fmap.refIndex;
+            m_mapActiveSel = std::min(m_mapActiveSel,
+                                      std::max(0, (int)fmap.entries.size() - 1));
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", m_mapMsg.c_str());
+
+        if (!fmap.ok) {
+            ImGui::TextWrapped("No map yet. Mark cells with the Field Survey window "
+                               "(labels like REF, A1 ...), then press Build.");
+            ImGui::End();
+            return;
+        }
+
+        // ---- 参考格 / 活动格 / 补偿开关 ----
+        auto labelGetter = [](void* data, int idx, const char** out) {
+            const auto* es = static_cast<const std::vector<MagFieldMap::Entry>*>(data);
+            if (idx < 0 || idx >= (int)es->size()) return false;
+            *out = (*es)[idx].label;
+            return true;
+        };
+        ImGui::SetNextItemWidth(150);
+        if (ImGui::Combo("Reference cell", &m_mapRefSel, labelGetter,
+                         (void*)&fmap.entries, (int)fmap.entries.size())) {
+            m_sensorThread.setFieldMapRef(m_mapRefSel);
+            m_sensorThread.fieldMapSnapshot(fmap);
+        }
+        ImGui::SetNextItemWidth(150);
+        if (ImGui::Combo("Active cell (sensor is HERE)", &m_mapActiveSel, labelGetter,
+                         (void*)&fmap.entries, (int)fmap.entries.size())) {
+            m_sensorThread.setFieldMapActive(m_mapActiveSel);
+        }
+        ImGui::SameLine();
+        bool on = m_sensorThread.fieldMapEnabled();
+        if (ImGui::Checkbox("Apply compensation", &on))
+            m_sensorThread.setFieldMapEnabled(on);
+
+        // ---- 一致性警告 ----
+        MagEllipsoidCalib::Result fit;
+        m_sensorThread.magFitSnapshot(fit);
+        if (fmap.fieldMagAtBuild > 1e-6
+            && std::fabs(fit.fieldMag - fmap.fieldMagAtBuild) > 0.02 * fmap.fieldMagAtBuild)
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                "Ellipsoid calibration changed since map was built (%.1f -> %.1f uT)"
+                " - rebuild the map!", fmap.fieldMagAtBuild, fit.fieldMag);
+        const int act = std::max(0, std::min(m_sensorThread.fieldMapActive(),
+                                             (int)fmap.entries.size() - 1));
+        if (m_sensorThread.fieldMapEnabled())
+            ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f),
+                "COMPENSATION ON - active cell: %s. Control Panel heading and all"
+                " three filters now see the reference-point field.",
+                fmap.entries[act].label);
+
+        // ---- 验证读数：原始 vs 补偿后的实时航向（最近 ~1.5 s 圆周平均） ----
+        // 单样本噪声 ±2~3 deg 没法读；航向是角度量，必须圆周平均避免 ±180° 跳变。
+        // 移动/旋转时读数会滞后 ~1.5 s，停下来等它稳定再读。
+        {
+            std::vector<SensorData> data;
+            const double rate5 = m_sensorThread.linkRate5s();
+            int winN = rate5 > 1.0 ? (int)(rate5 * 1.5 + 0.5) : 150;
+            winN = std::max(20, std::min(400, winN));
+            m_buffer.fillLatest(data, (size_t)winN);
+            double sR = 0, cR = 0, sC = 0, cC = 0, sD = 0, cD = 0;
+            int nUsed = 0;
+            for (const auto& d : data) {
+                const float aN = std::sqrt(d.acc[0] * d.acc[0] + d.acc[1] * d.acc[1]
+                                         + d.acc[2] * d.acc[2]);
+                if (aN <= 0.0f) continue;
+                auto headingOf = [&](const float m[3]) -> double {
+                    const float axn = -d.acc[0] / aN, ayn = -d.acc[1] / aN, azn = -d.acc[2] / aN;
+                    const float roll = std::atan2(ayn, azn);
+                    const float pitch = std::atan2(-axn, std::sqrt(ayn * ayn + azn * azn));
+                    const float cr = std::cos(roll), sr = std::sin(roll);
+                    const float cp = std::cos(pitch), sp = std::sin(pitch);
+                    const float mxh = m[0] * cp + m[1] * sr * sp + m[2] * cr * sp;
+                    const float myh = m[1] * cr - m[2] * sr;
+                    return std::atan2(-(double)myh, (double)mxh) * (180.0 / kPi);
+                };
+                const double hr = headingOf(d.magUnc) * kPi / 180.0;
+                const double hc = headingOf(d.mag) * kPi / 180.0;
+                sR += std::sin(hr); cR += std::cos(hr);
+                sC += std::sin(hc); cC += std::cos(hc);
+                const double dd = hc - hr;
+                sD += std::sin(dd); cD += std::cos(dd);
+                ++nUsed;
+            }
+            if (nUsed > 0) {
+                const double hRaw = std::atan2(sR, cR) * 180.0 / kPi;
+                const double hComp = std::atan2(sC, cC) * 180.0 / kPi;
+                const double dlt = std::atan2(sD, cD) * 180.0 / kPi;
+                ImGui::Separator();
+                ImGui::Text("Heading raw          : %8.2f deg", hRaw);
+                ImGui::Text("Heading compensated  : %8.2f deg", hComp);
+                ImGui::Text("Delta (comp - raw)   : %+8.2f deg", dlt);
+                ImGui::TextDisabled("comp = raw + delta;  |delta| should equal the active"
+                                    " cell's |dHeading| (sign flipped: delta = ref - cell)");
+                ImGui::TextDisabled("smoothed over ~1.5 s (%d samples); settles ~1.5 s"
+                                    " after you stop moving", nUsed);
+            }
+        }
+
+        // ---- 场图表格 ----
+        ImGui::Separator();
+        if (ImGui::BeginTable("mapEntries", 7,
+                              ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+            ImGui::TableSetupColumn("Label");
+            ImGui::TableSetupColumn("|B| (uT)");
+            ImGui::TableSetupColumn("Heading (deg)");
+            ImGui::TableSetupColumn("dHeading (deg)");
+            ImGui::TableSetupColumn("|dB| (uT)");
+            ImGui::TableSetupColumn("Scatter (deg)");
+            ImGui::TableSetupColumn("N");
+            ImGui::TableHeadersRow();
+            const auto& eR = fmap.entries[fmap.refIndex];
+            for (int i = 0; i < (int)fmap.entries.size(); ++i) {
+                const auto& e = fmap.entries[i];
+                ImGui::TableNextRow();
+                if (i == act)
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1,
+                                           IM_COL32(70, 90, 130, 100));
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(e.label);
+                ImGui::TableNextColumn();
+                ImGui::Text("%.2f", e.fieldMag);
+                ImGui::TableNextColumn();
+                ImGui::Text("%.2f", e.headingDeg);
+                ImGui::TableNextColumn();
+                double dh = e.headingDeg - eR.headingDeg;
+                dh = std::atan2(std::sin(dh * kPi / 180.0), std::cos(dh * kPi / 180.0))
+                     * 180.0 / kPi;
+                if (std::fabs(dh) >= 3.0)
+                    ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.4f, 1.0f), "%+.2f", dh);
+                else
+                    ImGui::Text("%+.2f", dh);
+                ImGui::TableNextColumn();
+                double dL[3];
+                fmap.deltaLevel(i, dL);
+                ImGui::Text("%.2f",
+                            std::sqrt(dL[0] * dL[0] + dL[1] * dL[1] + dL[2] * dL[2]));
+                ImGui::TableNextColumn();
+                ImGui::Text("%.2f", e.scatterDeg);
+                ImGui::TableNextColumn();
+                ImGui::Text("%d", e.nSamples);
+            }
+            ImGui::EndTable();
+        }
+        ImGui::TextDisabled("dHeading / |dB| are relative to the reference cell.");
+        ImGui::TextDisabled("Scatter = max heading spread across sessions of the same label"
+                            " (placement repeatability).");
 
         ImGui::End();
     }
@@ -2004,4 +2198,9 @@ private:
     int m_surveyWindowSec = 2;                              ///< 统计窗口长度 (s)
     char m_surveyLabel[40] = "A1";                          ///< 格点标签输入框
     std::vector<SensorThread::SurveyMark> m_surveyHistory;  ///< 本会话已 Mark 的记录（供 Δ 表显示）
+
+    // Field Map 窗口状态
+    int m_mapRefSel = 0;        ///< 参考格下标（Combo 选择）
+    int m_mapActiveSel = 0;     ///< 活动格下标（Combo 选择）
+    std::string m_mapMsg = "build from field_survey.txt after marking cells";
 };
