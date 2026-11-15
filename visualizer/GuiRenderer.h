@@ -703,6 +703,26 @@ private:
             return;
         }
 
+        // ---- 地图自检：修正后的场向量模长应约等于 |B| ----
+        // 旧版建图 bug 会把向量放大到 1.04~1.17 倍（离校准场强越远越大）。
+        // 此行同时可用于确认运行的是新版 exe（旧版没有这一行）。
+        {
+            double maxRatio = 0.0;
+            for (const auto& e : fmap.entries) {
+                const double n = std::sqrt(e.fieldLevel[0] * e.fieldLevel[0]
+                                         + e.fieldLevel[1] * e.fieldLevel[1]
+                                         + e.fieldLevel[2] * e.fieldLevel[2]);
+                if (e.fieldMag > 1e-6)
+                    maxRatio = std::max(maxRatio, n / e.fieldMag);
+            }
+            if (maxRatio > 0.90 && maxRatio < 1.02)
+                ImGui::TextDisabled("map self-check: max |vec|/|B| = %.3f (OK)", maxRatio);
+            else
+                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.4f, 1.0f),
+                    "map self-check: max |vec|/|B| = %.3f (STALE MAP - press Build!)",
+                    maxRatio);
+        }
+
         // ---- 参考格 / 活动格 / 补偿开关 ----
         auto labelGetter = [](void* data, int idx, const char** out) {
             const auto* es = static_cast<const std::vector<MagFieldMap::Entry>*>(data);
@@ -725,6 +745,85 @@ private:
         bool on = m_sensorThread.fieldMapEnabled();
         if (ImGui::Checkbox("Apply compensation", &on))
             m_sensorThread.setFieldMapEnabled(on);
+
+        // ---- 自动定位（Haverinen 2009 快照版基线）----
+        // 用对水平朝向不变的指纹 (|B|, Zh) 做最近邻；静止占多数才参与匹配，
+        // 同一格连续命中约 1 s 且明显优于次优才切换活动格（滞回，防抖动）。
+        if (ImGui::Checkbox("Auto-select active cell (fingerprint)", &m_mapAuto)) {
+            m_autoCandidate = -1;
+            m_autoStreak = 0;
+            m_autoDispText[0] = '\0';
+        }
+        if (m_mapAuto) {
+            ImGui::SameLine();
+            ImGui::Checkbox("use heading (aligned placement)", &m_mapFpHeading);
+            std::vector<SensorData> data;
+            const double rate5b = m_sensorThread.linkRate5s();
+            int winA = rate5b > 1.0 ? (int)(rate5b * 1.5 + 0.5) : 150;
+            winA = std::max(20, std::min(400, winA));
+            m_buffer.fillLatest(data, (size_t)winA);
+            MagEllipsoidCalib::Result fitA;
+            m_sensorThread.magFitSnapshot(fitA);
+            double meanL[3] = { 0, 0, 0 };
+            int nStill = 0, nTot = 0;
+            for (const auto& d : data) {
+                ++nTot;
+                const float gN = std::sqrt(d.gyro[0] * d.gyro[0] + d.gyro[1] * d.gyro[1]
+                                         + d.gyro[2] * d.gyro[2]);
+                const float aN = std::sqrt(d.acc[0] * d.acc[0] + d.acc[1] * d.acc[1]
+                                         + d.acc[2] * d.acc[2]);
+                if (gN > 5.0f || aN < 0.85f || aN > 1.15f) continue;
+                const double accD[3] = { d.acc[0], d.acc[1], d.acc[2] };
+                double roll, pitch, L[3];
+                MagFieldMap::accToRollPitch(accD, roll, pitch);
+                const double Bs[3] = { (double)d.magUnc[0] * fitA.fieldMag,
+                                       (double)d.magUnc[1] * fitA.fieldMag,
+                                       (double)d.magUnc[2] * fitA.fieldMag };
+                MagFieldMap::toLevel(Bs, roll, pitch, L);
+                for (int i = 0; i < 3; ++i) meanL[i] += L[i];
+                ++nStill;
+            }
+            char txt[160];
+            if (nStill >= 20 && 3 * nStill >= nTot) {   // 静止占多数才匹配
+                for (int i = 0; i < 3; ++i) meanL[i] /= nStill;
+                double bestS = 0.0, nextS = 0.0;
+                const int cand = MagFieldMap::localizeInvariant(meanL, fmap, 0.6, 0.8,
+                                                                m_mapFpHeading
+                                                                    ? 3.0 * kPi / 180.0
+                                                                    : 0.0,
+                                                                bestS, nextS);
+                if (cand < 0) {
+                    snprintf(txt, sizeof(txt), "auto: no map");
+                } else {
+                    // 质量门限：区分度主要靠"明显优于次优"（简并/二义时拒锁）。
+                    // 绝对门限放宽到 15：重放置噪声本身就能把自格得分打到 4~12
+                    // （实测 A1/A2/A3），卡 4.0 会误伤 A3 这种"次优差 4 倍"的
+                    // 无争议匹配。
+                    const bool goodMatch = bestS < 15.0 && bestS < 0.5 * nextS;
+                    if (cand == m_autoCandidate) ++m_autoStreak;
+                    else { m_autoCandidate = cand; m_autoStreak = 1; }
+                    const int actNow = m_sensorThread.fieldMapActive();
+                    if (goodMatch && m_autoStreak >= 60 && m_autoCandidate != actNow) {
+                        m_sensorThread.setFieldMapActive(m_autoCandidate);
+                        m_mapActiveSel = m_autoCandidate;
+                    }
+                    const char* tag = (m_autoCandidate == m_sensorThread.fieldMapActive())
+                                    ? "LOCKED" : "candidate";
+                    snprintf(txt, sizeof(txt),
+                             "auto: %s %s (score %.2f, next %.2f, hold %.1fs)",
+                             tag, fmap.entries[m_autoCandidate].label,
+                             bestS, nextS, m_autoStreak / 60.0);
+                }
+            } else {
+                m_autoStreak = 0;   // 移动中：清零等待放稳
+                snprintf(txt, sizeof(txt), "auto: moving...");
+            }
+            // 状态行约 2 Hz 刷新（每 30 帧），数值不再逐帧跳动
+            ++m_autoDispTick;
+            if (m_autoDispText[0] == '\0' || m_autoDispTick % 30 == 0)
+                snprintf(m_autoDispText, sizeof(m_autoDispText), "%s", txt);
+            ImGui::TextUnformatted(m_autoDispText);
+        }
 
         // ---- 一致性警告 ----
         MagEllipsoidCalib::Result fit;
@@ -2203,4 +2302,10 @@ private:
     int m_mapRefSel = 0;        ///< 参考格下标（Combo 选择）
     int m_mapActiveSel = 0;     ///< 活动格下标（Combo 选择）
     std::string m_mapMsg = "build from field_survey.txt after marking cells";
+    bool m_mapAuto = false;     ///< 自动选活动格（指纹定位）
+    bool m_mapFpHeading = true; ///< 指纹包含场方位角（区分度最高，但要求放置朝向对齐）
+    int m_autoCandidate = -1;   ///< 当前候选格（滞回）
+    int m_autoStreak = 0;       ///< 候选连续命中帧数（60fps 下 60 帧约 1 s）
+    int m_autoDispTick = 0;     ///< 状态行刷新节拍（每 30 帧 ≈ 0.5 s 刷新一次）
+    char m_autoDispText[160] = "";  ///< 节流后的状态行文本
 };

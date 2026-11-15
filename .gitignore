@@ -16,3 +16,5 @@ imu_data_*.txt
 # 系统杂项
 Thumbs.db
 Desktop.ini
+
+*.pdf

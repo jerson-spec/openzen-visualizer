@@ -163,8 +163,17 @@ public:
             std::vector<double> hs;
             hs.reserve(groups[g].size());
             for (const SurveyRow* r : groups[g]) {
-                const double Bs[3] = { r->magUnit[0] * r->bMag, r->magUnit[1] * r->bMag,
-                                       r->magUnit[2] * r->bMag };
+                // SurveyMark 里的 magUnit 是 apply() 输出的均值，其模 =
+                // |B|/fieldMag（椭球拟合把校准点的场归一到 1，别处并非 1）。
+                // 必须先归一化再乘 bMag，否则场向量被额外放大 |B|/fieldMag 倍
+                // （曾把每格向量放大 0.98~1.17 倍不等，离校准场强越远错得越多）。
+                const double mN = std::sqrt(r->magUnit[0] * r->magUnit[0]
+                                          + r->magUnit[1] * r->magUnit[1]
+                                          + r->magUnit[2] * r->magUnit[2]);
+                if (mN < 1e-9) continue;
+                const double Bs[3] = { r->magUnit[0] / mN * r->bMag,
+                                       r->magUnit[1] / mN * r->bMag,
+                                       r->magUnit[2] / mN * r->bMag };
                 double roll, pitch, L[3];
                 accToRollPitch(r->acc, roll, pitch);
                 const double h = toLevel(Bs, roll, pitch, L);
@@ -274,5 +283,56 @@ public:
         out[0] =  Xh * cp - Zh * sp;
         out[1] =  Xh * sr * sp + Yh * cr + Zh * sr * cp;
         out[2] =  Xh * cr * sp - Yh * sr + Zh * cr * cp;
+    }
+
+    /**
+     * @brief 静态指纹最近邻定位（Haverinen & Kemppainen 2009 的快照版基线）。
+     *
+     * 特征：|B| 与 level 系竖直分量 Zh（对绕竖轴旋转不变）；若 sigmaAzRad > 0，
+     * 额外使用场方位角——它区分度最高，但要求标定与测试时传感器的放置
+     * 朝向一致（贴基准边对齐的桌面工作流满足此条件）。
+     * 返回最优条目下标；bestScore/runnerUpScore 是加权平方距离，
+     * 供滞回切换与置信度显示使用。
+     *
+     * @param measLevel  运行时测量的 level 系平均向量 (uT，用未补偿 magUnc 通道)
+     * @param sigmaB     |B| 量测噪声尺度 (uT)
+     * @param sigmaZ     竖直分量量测噪声尺度 (uT)
+     * @param sigmaAzRad 场方位角噪声尺度 (rad)；<=0 表示不使用方向特征
+     */
+    static int localizeInvariant(const double measLevel[3], const Result& r,
+                                 double sigmaB, double sigmaZ, double sigmaAzRad,
+                                 double& bestScore, double& runnerUpScore) {
+        if (!r.ok || r.entries.empty()) return -1;
+        const double measNorm = std::sqrt(measLevel[0] * measLevel[0]
+                                        + measLevel[1] * measLevel[1]
+                                        + measLevel[2] * measLevel[2]);
+        const double measZ = measLevel[2];
+        const double measAz = std::atan2(-measLevel[1], measLevel[0]);
+        int best = 0;
+        bestScore = 1e30;
+        runnerUpScore = 1e30;
+        for (size_t i = 0; i < r.entries.size(); ++i) {
+            const auto& e = r.entries[i];
+            const double n = std::sqrt(e.fieldLevel[0] * e.fieldLevel[0]
+                                     + e.fieldLevel[1] * e.fieldLevel[1]
+                                     + e.fieldLevel[2] * e.fieldLevel[2]);
+            const double dB = (measNorm - n) / sigmaB;
+            const double dZ = (measZ - e.fieldLevel[2]) / sigmaZ;
+            double s = dB * dB + dZ * dZ;
+            if (sigmaAzRad > 1e-9) {
+                const double eAz = std::atan2(-e.fieldLevel[1], e.fieldLevel[0]);
+                const double dA = std::atan2(std::sin(measAz - eAz),
+                                             std::cos(measAz - eAz)) / sigmaAzRad;
+                s += dA * dA;
+            }
+            if (s < bestScore) {
+                runnerUpScore = bestScore;
+                bestScore = s;
+                best = (int)i;
+            } else if (s < runnerUpScore) {
+                runnerUpScore = s;
+            }
+        }
+        return best;
     }
 };
