@@ -18,3 +18,8 @@ Thumbs.db
 Desktop.ini
 
 *.pdf
+
+# 个人学术文档与交接材料（含个人信息/导师批注，公开仓库不收录）
+开题报告/
+交接文档*.md
+setup_new_build.bat
