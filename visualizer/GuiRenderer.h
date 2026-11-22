@@ -807,8 +807,17 @@ private:
                         m_sensorThread.setFieldMapActive(m_autoCandidate);
                         m_mapActiveSel = m_autoCandidate;
                     }
-                    const char* tag = (m_autoCandidate == m_sensorThread.fieldMapActive())
-                                    ? "LOCKED" : "candidate";
+                    // LOCKED 判据必须与质量门限绑定：候选==活动格只说明"没换格"，
+                    // 不说明匹配通过——旧判据在 score 远超门限（实际拒锁）时仍显示
+                    // LOCKED，Test A 的 12/13 拒锁全被误标（门限行为本身正确）。
+                    // 三态：LOCKED=门限通过且滞回满足，确认持有该格；
+                    // UNSTABLE=当前活动格指纹失配（环境漂移/离开建图区的健康信号）；
+                    // candidate=评估中（未达滞回或非当前格）。
+                    const bool lockHeld = goodMatch && m_autoStreak >= 60
+                                        && m_autoCandidate == m_sensorThread.fieldMapActive();
+                    const char* tag = lockHeld ? "LOCKED"
+                                    : (m_autoCandidate == m_sensorThread.fieldMapActive()
+                                           ? "UNSTABLE" : "candidate");
                     snprintf(txt, sizeof(txt),
                              "auto: %s %s (score %.2f, next %.2f, hold %.1fs)",
                              tag, fmap.entries[m_autoCandidate].label,
